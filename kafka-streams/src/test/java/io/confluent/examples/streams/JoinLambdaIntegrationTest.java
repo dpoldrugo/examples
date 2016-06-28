@@ -14,6 +14,7 @@
 
 package io.confluent.examples.streams;
 
+import com.google.common.collect.Lists;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.LongDeserializer;
@@ -32,9 +33,11 @@ import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Test;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.ExecutionException;
 
 import io.confluent.examples.streams.kafka.EmbeddedSingleNodeKafkaCluster;
 
@@ -95,38 +98,23 @@ public class JoinLambdaIntegrationTest {
 
   @Test
   public void shouldCountClicksPerRegion() throws Exception {
+
+    System.out.println(CLUSTER.zookeeperConnect());
     // Input 1: Clicks per user (multiple records allowed per user).
     List<KeyValue<String, Long>> userClicks = Arrays.asList(
         new KeyValue<>("alice", 13L),
-        new KeyValue<>("bob", 4L),
-        new KeyValue<>("chao", 25L),
-        new KeyValue<>("bob", 19L),
-        new KeyValue<>("dave", 56L),
-        new KeyValue<>("eve", 78L),
-        new KeyValue<>("alice", 40L),
-        new KeyValue<>("fang", 99L)
+        new KeyValue<>("alice", 7L)
     );
 
     // Input 2: Region per user (multiple records allowed per user).
     List<KeyValue<String, String>> userRegions = Arrays.asList(
         new KeyValue<>("alice", "asia"),   /* Alice lived in Asia originally... */
-        new KeyValue<>("bob", "americas"),
-        new KeyValue<>("chao", "asia"),
-        new KeyValue<>("dave", "europe"),
-        new KeyValue<>("alice", "europe"), /* ...but moved to Europe some time later. */
-        new KeyValue<>("eve", "americas"),
-        new KeyValue<>("fang", "asia")
+        new KeyValue<>("alice", "europe") /* ...but moved to Europe some time later. */
     );
 
     List<KeyValue<String, Long>> expectedClicksPerRegion = Arrays.asList(
-        new KeyValue<>("europe", 13L),
-        new KeyValue<>("americas", 4L),
-        new KeyValue<>("asia", 25L),
-        new KeyValue<>("americas", 23L),
-        new KeyValue<>("europe", 69L),
-        new KeyValue<>("americas", 101L),
-        new KeyValue<>("europe", 109L),
-        new KeyValue<>("asia", 124L)
+        new KeyValue<>("asia", 13L),
+        new KeyValue<>("europe", 7L)
     );
 
     //
@@ -179,7 +167,7 @@ public class JoinLambdaIntegrationTest {
     //
     // The resulting KTable is continuously being updated as new data records are arriving in the
     // input KStream `userClicksStream` and input KTable `userRegionsTable`.
-    KTable<String, Long> clicksPerRegion = userClicksStream
+    KStream<String, String> clicksPerRegion = userClicksStream
         // Join the stream against the table.
         //
         // Null values possible: In general, null values are possible for region (i.e. the value of
@@ -193,57 +181,110 @@ public class JoinLambdaIntegrationTest {
         // achieve the same effect.
         .leftJoin(userRegionsTable, (clicks, region) -> new RegionWithClicks(region == null ? "UNKNOWN" : region, clicks))
         // Change the stream from <user> -> <region, clicks> to <region> -> <clicks>
-        .map((user, regionWithClicks) -> new KeyValue<>(regionWithClicks.getRegion(), regionWithClicks.getClicks()))
+        .flatMap((user, regionWithClicks) -> {
+          ArrayList<KeyValue<String, String>> objects = Lists.newArrayList();
+          objects.add(new KeyValue<>(regionWithClicks.getRegion()+"_A", "S:"+regionWithClicks.getClicks()));
+          objects.add(new KeyValue<>(regionWithClicks.getRegion()+"_B", "S:"+regionWithClicks.getClicks()));
+          return objects;
+        });
         // Compute the total per region by summing the individual click counts per region.
-        .reduceByKey(
-            (firstClicks, secondClicks) -> firstClicks + secondClicks,
-            stringSerde, longSerde, "ClicksPerRegionUnwindowed");
+        //.reduceByKey(
+        //    (firstClicks, secondClicks) -> firstClicks + secondClicks,
+        //    stringSerde, longSerde, "ClicksPerRegionUnwindowed");
 
     // Write the (continuously updating) results to the output topic.
-    clicksPerRegion.to(stringSerde, longSerde, outputTopic);
+    clicksPerRegion.to(stringSerde, stringSerde, outputTopic);
 
     KafkaStreams streams = new KafkaStreams(builder, streamsConfiguration);
     streams.start();
 
-    //
-    // Step 2: Publish user-region information.
-    //
-    // To keep this code example simple and easier to understand/reason about, we publish all
-    // user-region records before any user-click records (cf. step 3).  In practice though,
-    // data records would typically be arriving concurrently in both input streams/topics.
-    Properties userRegionsProducerConfig = new Properties();
-    userRegionsProducerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
-    userRegionsProducerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
-    userRegionsProducerConfig.put(ProducerConfig.RETRIES_CONFIG, 0);
-    userRegionsProducerConfig.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-    userRegionsProducerConfig.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-    IntegrationTestUtils.produceKeyValuesSynchronously(userRegionsTopic, userRegions, userRegionsProducerConfig);
-
-    //
-    // Step 3: Publish some user click events.
-    //
-    Properties userClicksProducerConfig = new Properties();
-    userClicksProducerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
-    userClicksProducerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
-    userClicksProducerConfig.put(ProducerConfig.RETRIES_CONFIG, 0);
-    userClicksProducerConfig.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-    userClicksProducerConfig.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, LongSerializer.class);
-    IntegrationTestUtils.produceKeyValuesSynchronously(userClicksTopic, userClicks, userClicksProducerConfig);
+    new Thread(() -> {
 
 
-    //
-    // Step 4: Verify the application's output data.
-    //
-    Properties consumerConfig = new Properties();
-    consumerConfig.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
-    consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, "join-lambda-integration-test-standard-consumer");
-    consumerConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-    consumerConfig.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-    consumerConfig.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, LongDeserializer.class);
-    List<KeyValue<String, Long>> actualClicksPerRegion = IntegrationTestUtils.waitUntilMinKeyValueRecordsReceived(consumerConfig,
-        outputTopic, expectedClicksPerRegion.size());
-    streams.close();
-    assertThat(actualClicksPerRegion).containsExactlyElementsOf(expectedClicksPerRegion);
+      //
+      // Step 2: Publish user-region information.
+      //
+      // To keep this code example simple and easier to understand/reason about, we publish all
+      // user-region records before any user-click records (cf. step 3).  In practice though,
+      // data records would typically be arriving concurrently in both input streams/topics.
+      Properties userRegionsProducerConfig = new Properties();
+      userRegionsProducerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
+      userRegionsProducerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
+      userRegionsProducerConfig.put(ProducerConfig.RETRIES_CONFIG, 0);
+      userRegionsProducerConfig.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+      userRegionsProducerConfig.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+      try {
+        for (KeyValue<String, String> userRegion : userRegions) {
+            IntegrationTestUtils.produceKeyValuesSynchronously(userRegionsTopic, Arrays.asList(userRegions.get(1)), userRegionsProducerConfig);
+          System.out.println(userRegion);
+        }
+
+      } catch (ExecutionException e) {
+        e.printStackTrace();
+      } catch (InterruptedException e) {
+        e.printStackTrace();
+      }
+    }).start();
+
+    new Thread(() -> {
+      //
+      // Step 3: Publish some user click events.
+      //
+      Properties userClicksProducerConfig = new Properties();
+      userClicksProducerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
+      userClicksProducerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
+      userClicksProducerConfig.put(ProducerConfig.RETRIES_CONFIG, 0);
+      userClicksProducerConfig.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+      userClicksProducerConfig.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, LongSerializer.class);
+      try {
+        for (KeyValue<String, Long> userClick : userClicks) {
+          IntegrationTestUtils.produceKeyValuesSynchronously(userClicksTopic, Arrays.asList(userClick), userClicksProducerConfig);
+          System.out.println(userClick);
+        }
+
+      } catch (ExecutionException e) {
+        e.printStackTrace();
+      } catch (InterruptedException e) {
+        e.printStackTrace();
+      }
+
+    }).start();
+
+
+      //
+      // Step 4: Verify the application's output data.
+      //
+      Properties consumerConfig = new Properties();
+      consumerConfig.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
+      consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, "join-lambda-integration-test-standard-consumer");
+      consumerConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
+      consumerConfig.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, 30000);
+      consumerConfig.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+      consumerConfig.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+
+      new Thread(() -> {
+          while (true) {
+              try {
+                  Thread.sleep(50);
+              } catch (InterruptedException e) {
+                  e.printStackTrace();
+              }
+              List<KeyValue<Object, Object>> r = IntegrationTestUtils.readKeyValues(userRegionsTopic, consumerConfig);
+              List<KeyValue<Object, Object>> u = IntegrationTestUtils.readKeyValues(userClicksTopic, consumerConfig);
+              List<KeyValue<Object, Object>> o = IntegrationTestUtils.readKeyValues(outputTopic, consumerConfig);
+
+              System.out.println(userRegionsTopic+": " + r);
+              System.out.println(userClicksTopic+": " + u);
+              System.out.println(outputTopic+": " + o);
+          }
+
+
+      }).start();
+
+      List<KeyValue<String, Long>> actualClicksPerRegion = IntegrationTestUtils.waitUntilMinKeyValueRecordsReceived(consumerConfig,
+              outputTopic, expectedClicksPerRegion.size());
+      streams.close();
+      assertThat(actualClicksPerRegion).containsExactlyElementsOf(expectedClicksPerRegion);
   }
 
 }
