@@ -119,7 +119,7 @@ public class NocIntegrationTest {
           JoinMessage joinMessage = new JoinMessage(trafficMessage.getSequenceId(), trafficMessage.getStatusId(), deltaMessage.getCountDelta());
 
           return joinMessage;
-        }, JoinWindows.of("ddsdf").within(TimeUnit.SECONDS.toMillis(1)), intSerde, trafficMessageSerde, deltaMessageSerde);
+        }, JoinWindows.of("joinName").within(TimeUnit.SECONDS.toMillis(1)), intSerde, trafficMessageSerde, deltaMessageSerde);
 
     // Write the (continuously updating) results to the output topic.
     joinStream.to(intSerde, joinMessageSerde, outputTopic);
