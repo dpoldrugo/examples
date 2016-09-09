@@ -16,6 +16,7 @@ package io.confluent.examples.streams;
 
 import io.confluent.examples.streams.kafka.EmbeddedSingleNodeKafkaCluster;
 import io.confluent.examples.streams.noc.*;
+import org.apache.commons.lang.math.RandomUtils;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.*;
@@ -23,7 +24,6 @@ import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.kstream.*;
-import org.codehaus.jackson.map.ObjectMapper;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Test;
@@ -51,6 +51,7 @@ public class NocIntegrationTest {
   private static final String trafficMessagesTopic = "traffic-messages";
   private static final String deltaMessagesTopic = "delta-messages";
   private static final String outputTopic = "output-topic";
+  private static final String outputTopicAgg = "output-topic-agg";
 
   @BeforeClass
   public static void startKafkaCluster() throws Exception {
@@ -59,24 +60,8 @@ public class NocIntegrationTest {
     CLUSTER.createTopic(outputTopic);
   }
 
-  private static final ObjectMapper mapper = new ObjectMapper();
-
   @Test
   public void shouldJoinTrafficAndDeltas() throws Exception {
-    List<KeyValue<Integer, TrafficMessage>> trafficData = Arrays.asList(
-        new KeyValue<>(1, new TrafficMessage(1, 3))
-    );
-
-    List<KeyValue<Integer, DeltaMessage>> deltaData = Arrays.asList(
-        new KeyValue<>(1, new DeltaMessage(1, 1)),
-        new KeyValue<>(1, new DeltaMessage(1, 1))
-    );
-
-    List<KeyValue<Integer, JoinMessage>> expectedJoinMessages = Arrays.asList(
-        new KeyValue<>(1, new JoinMessage(1, 3, 1)),
-        new KeyValue<>(1, new JoinMessage(1, 3, 1))
-    );
-
     //
     // Step 1: Configure and start the processor topology.
     //
@@ -110,11 +95,11 @@ public class NocIntegrationTest {
 
     KStream<Integer, TrafficMessage> trafficMessagesStream = builder.stream(intSerde, trafficMessageSerde, trafficMessagesTopic);
 
-    KStream<Integer, DeltaMessage> deltaMessagesTable =
+    KStream<Integer, DeltaMessage> deltaMessagesStream =
         builder.stream(intSerde, deltaMessageSerde, deltaMessagesTopic);
 
     KStream<Integer, JoinMessage> joinStream = trafficMessagesStream
-        .join(deltaMessagesTable, (trafficMessage, deltaMessage) -> {
+        .join(deltaMessagesStream, (trafficMessage, deltaMessage) -> {
 
           JoinMessage joinMessage = new JoinMessage(trafficMessage.getSequenceId(), trafficMessage.getStatusId(), deltaMessage.getCountDelta());
 
@@ -124,38 +109,112 @@ public class NocIntegrationTest {
     // Write the (continuously updating) results to the output topic.
     joinStream.to(intSerde, joinMessageSerde, outputTopic);
 
+    KStream<Integer, JoinMessage> outStream = builder.stream(intSerde, joinMessageSerde, outputTopic);
+
+    KTable<Integer, JoinMessage> outStreamAgg = outStream.aggregateByKey(() -> new JoinMessage(-1, -1, 0), (aggKey, value, aggregate) -> {
+      return new JoinMessage(aggKey, value.getStatusId(), value.getCountDelta() + aggregate.getCountDelta());
+    }, intSerde, joinMessageSerde, "join-agg");
+
+    outStreamAgg.to(intSerde, joinMessageSerde, outputTopicAgg);
+
     KafkaStreams streams = new KafkaStreams(builder, streamsConfiguration);
     streams.start();
 
+    Properties deltaMessagesProducerConfig = deltaMessagesProducerConfig();
 
-    Properties deltaMessagesProducerConfig = new Properties();
-    deltaMessagesProducerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
-    deltaMessagesProducerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
-    deltaMessagesProducerConfig.put(ProducerConfig.RETRIES_CONFIG, 0);
-    deltaMessagesProducerConfig.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, IntegerSerializer.class);
-    deltaMessagesProducerConfig.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, DeltaMessageSerializer.class);
+    Properties trafficMessagesProducerConfig = trafficMessagesProducerConfig();
+
+    List<KeyValue<Integer, TrafficMessage>> trafficData = Arrays.asList(
+            new KeyValue<>(1, new TrafficMessage(1, 3))
+    );
+
+    List<KeyValue<Integer, DeltaMessage>> deltaData = Arrays.asList(
+            new KeyValue<>(1, new DeltaMessage(1, 1)),
+            new KeyValue<>(1, new DeltaMessage(1, 6))
+
+    );
+
+    List<KeyValue<Integer, JoinMessage>> expectedJoinMessages = Arrays.asList(
+            new KeyValue<>(1, new JoinMessage(1, 3, 1)),
+            new KeyValue<>(1, new JoinMessage(1, 3, 6))
+    );
+
+    List<KeyValue<Integer, JoinMessage>> expectedOutMessagesAgg = Arrays.asList(
+            new KeyValue<>(1, new JoinMessage(1, 3, 1)),
+            new KeyValue<>(1, new JoinMessage(1, 3, 7))
+    );
+
+
+//    IntegrationTestUtils.produceKeyValuesSynchronously(trafficMessagesTopic, Arrays.asList(
+//            new KeyValue<>(1, new TrafficMessage(1, 5))
+//    ), trafficMessagesProducerConfig);
+
     IntegrationTestUtils.produceKeyValuesSynchronously(deltaMessagesTopic, deltaData, deltaMessagesProducerConfig);
 
+    IntegrationTestUtils.produceKeyValuesSynchronously(trafficMessagesTopic, trafficData, trafficMessagesProducerConfig);
+
+//    IntegrationTestUtils.produceKeyValuesSynchronously(deltaMessagesTopic, Arrays.asList(
+//            new KeyValue<>(1, new DeltaMessage(1, 2))
+//    ), deltaMessagesProducerConfig);
+
+
+    System.out.println(trafficMessagesTopic);
+    List<KeyValue<Integer, TrafficMessage>> trafficInTopic = IntegrationTestUtils.readKeyValues(trafficMessagesTopic, consumerConfig(IntegerDeserializer.class, TrafficMessageDeserializer.class));
+    System.out.println(trafficInTopic);
+
+
+    System.out.println(deltaMessagesTopic);
+    List<KeyValue<Integer, DeltaMessage>> deltasInTopic = IntegrationTestUtils.readKeyValues(deltaMessagesTopic, consumerConfig(IntegerDeserializer.class, DeltaMessageDeserializer.class));
+    System.out.println(deltasInTopic);
+
+    System.out.println(outputTopic);
+    List<KeyValue<Integer, DeltaMessage>> outputInTopic = IntegrationTestUtils.readKeyValues(outputTopic, consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class));
+    System.out.println(outputInTopic);
+
+    System.out.println(outputTopicAgg);
+    List<KeyValue<Integer, DeltaMessage>> outputAggInTopic = IntegrationTestUtils.readKeyValues(outputTopicAgg, consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class));
+    System.out.println(outputAggInTopic);
+
+
+    List<KeyValue<Integer, JoinMessage>> actualJoinMessages = IntegrationTestUtils.waitUntilMinKeyValueRecordsReceived(consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class),
+            outputTopic, expectedJoinMessages.size());
+
+    List<KeyValue<Integer, JoinMessage>> actualOutMessagesAgg = IntegrationTestUtils.waitUntilMinKeyValueRecordsReceived(consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class),
+            outputTopicAgg, expectedOutMessagesAgg.size());
+
+    streams.close();
+    assertThat(actualJoinMessages).containsExactlyElementsOf(expectedJoinMessages);
+    assertThat(actualOutMessagesAgg).containsExactlyElementsOf(expectedOutMessagesAgg);
+  }
+
+  private Properties consumerConfig(Class keyDeserializer, Class valueDeserializer) {
+    Properties consumerConfig = new Properties();
+    consumerConfig.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
+    consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, "noc-integration-test-standard-consumer-"+valueDeserializer.getSimpleName()+"-"+RandomUtils.nextInt(10000));
+    consumerConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+    consumerConfig.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, keyDeserializer);
+    consumerConfig.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, valueDeserializer);
+    return consumerConfig;
+  }
+
+  private Properties trafficMessagesProducerConfig() {
     Properties trafficMessagesProducerConfig = new Properties();
     trafficMessagesProducerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
     trafficMessagesProducerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
     trafficMessagesProducerConfig.put(ProducerConfig.RETRIES_CONFIG, 0);
     trafficMessagesProducerConfig.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, IntegerSerializer.class);
     trafficMessagesProducerConfig.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, TrafficMessageSerializer.class);
-    IntegrationTestUtils.produceKeyValuesSynchronously(trafficMessagesTopic, trafficData, trafficMessagesProducerConfig);
+    return trafficMessagesProducerConfig;
+  }
 
-
-    Properties consumerConfig = new Properties();
-    consumerConfig.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
-    consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, "noc-integration-test-standard-consumer");
-    consumerConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-    consumerConfig.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, IntegerDeserializer.class);
-    consumerConfig.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JoinMessageDeserializer.class);
-    List<KeyValue<Integer, JoinMessage>> actualJoinMessages = IntegrationTestUtils.waitUntilMinKeyValueRecordsReceived(consumerConfig,
-        outputTopic, expectedJoinMessages.size());
-
-    streams.close();
-    assertThat(actualJoinMessages).containsExactlyElementsOf(expectedJoinMessages);
+  private Properties deltaMessagesProducerConfig() {
+    Properties deltaMessagesProducerConfig = new Properties();
+    deltaMessagesProducerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
+    deltaMessagesProducerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
+    deltaMessagesProducerConfig.put(ProducerConfig.RETRIES_CONFIG, 0);
+    deltaMessagesProducerConfig.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, IntegerSerializer.class);
+    deltaMessagesProducerConfig.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, DeltaMessageSerializer.class);
+    return deltaMessagesProducerConfig;
   }
 
 }

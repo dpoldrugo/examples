@@ -47,6 +47,8 @@ public class PojoSerde {
 
             @Override
             public T deserialize(String topic, byte[] data) {
+                if (data == null)
+                    return null;
                 try {
                     return mapper.readValue(data, clazz);
                 } catch (IOException e) {
