@@ -29,7 +29,7 @@ import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 
 /**
- * Created by lmagdic on 08/09/16.
+ * Created by lmagdic (Lmagdic72@gmail.com) on 08/09/16.
  */
 public class PtInputTest {
 
@@ -109,7 +109,8 @@ public class PtInputTest {
         List<KeyValue<Integer, TrafficMessage>> trafficData = Arrays.asList(
                 TRAFFIC(1,3)
         );
-        IntegrationTestUtils.produceKeyValuesSynchronously(ptiMessagesTopic, trafficData, ptMessagesProducerConfig());
+        IntegrationTestUtils.produceKeyValuesSynchronously(ptiMessagesTopic, trafficData
+                , producerConfig(IntegerSerializer.class, TrafficMessageSerializer.class));
 
         //
         // STEP 9: Show output
@@ -143,14 +144,14 @@ public class PtInputTest {
         System.out.println(list);
     }
 
-    private Properties ptMessagesProducerConfig() {
-        Properties trafficMessagesProducerConfig = new Properties();
-        trafficMessagesProducerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
-        trafficMessagesProducerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
-        trafficMessagesProducerConfig.put(ProducerConfig.RETRIES_CONFIG, 0);
-        trafficMessagesProducerConfig.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, IntegerSerializer.class);
-        trafficMessagesProducerConfig.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, TrafficMessageSerializer.class);
-        return trafficMessagesProducerConfig;
+    private Properties producerConfig(Class keySerializer, Class valueSerializer) {
+        Properties producerConfig = new Properties();
+        producerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
+        producerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
+        producerConfig.put(ProducerConfig.RETRIES_CONFIG, 0);
+        producerConfig.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, keySerializer);
+        producerConfig.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, valueSerializer);
+        return producerConfig;
     }
 
     private Properties consumerConfig(Class keyDeserializer, Class valueDeserializer) {
