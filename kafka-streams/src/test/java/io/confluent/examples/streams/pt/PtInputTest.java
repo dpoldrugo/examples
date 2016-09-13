@@ -13,9 +13,12 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.*;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.kstream.internals.TimeWindow;
+import org.apache.kafka.streams.processor.StateStoreSupplier;
 import org.apache.kafka.streams.processor.TopologyBuilder;
 import org.apache.kafka.streams.KafkaStreams;
 
+import org.apache.kafka.streams.state.Stores;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Test;
@@ -41,11 +44,31 @@ public class PtInputTest {
 
     // output (sink topics)
     private static final String ptoKaskada0Topic = "pt-kaskada0-topic";
+    private static final String ptoDruidAgg = "pt-druidagg-topic";
+
+    //
+    // data model serdes (
+    //
+
+    // topic key is always string
+    private final StringDeserializer stringDeserializer = new StringDeserializer();
+    private final StringSerializer   stringSerializer   = new StringSerializer();
+
+    // TrafficMessage (borrowed from noc package)
+    private final Deserializer<TrafficMessage> trafficMessageDeserializer = PojoSerde.deserializer(TrafficMessage.class);
+    private final   Serializer<TrafficMessage> trafficMessageSerializer   = PojoSerde.serializer  (TrafficMessage.class);
+
+    // PtDruidAgg: SINKS TO DRUID
+    private final Deserializer<PtDruidAgg> ptDruidAggDeserializer = PojoSerde.deserializer(PtDruidAgg.class);
+    private final   Serializer<PtDruidAgg> ptDruidAggSerializer   = PojoSerde.serializer  (PtDruidAgg.class);
+    private final        Serde<PtDruidAgg> ptDruidAggSerde = Serdes.serdeFrom(ptDruidAggSerializer,ptDruidAggDeserializer);
+
 
     @BeforeClass
     public static void startKafkaCluster() throws Exception {
         CLUSTER.createTopic(ptiMessagesTopic);
         CLUSTER.createTopic(ptoKaskada0Topic);
+        CLUSTER.createTopic(ptoDruidAgg);
     }
 
     @Test
@@ -63,6 +86,7 @@ public class PtInputTest {
         automataConfig.put(StreamsConfig.KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
         automataConfig.put(StreamsConfig.VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
         automataConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        //System.out.println(automataConfig); if (true) return;
 
         // Explicitly place the state directory under /tmp so that we can remove it via
         // `purgeLocalStreamsState` below.  Once Streams is updated to expose the effective
@@ -76,24 +100,28 @@ public class PtInputTest {
 
 
         //
-        // STEP 1b: Support data model
-        // TrafficMessage (borrowed from noc package)
+        // STEP 1b: Build Topology
         //
-        final StringSerializer   stringSerializer   = new StringSerializer();
-        final StringDeserializer stringDeserializer = new StringDeserializer();
 
-        final Deserializer<TrafficMessage> trafficMessageDeserializer = PojoSerde.deserializer(TrafficMessage.class);
-        final Serializer  <TrafficMessage> trafficMessageSerializer   = PojoSerde.serializer  (TrafficMessage.class);
+        StateStoreSupplier druidStoreSupplier = Stores.create("druid-store")
+                .withStringKeys()
+                .withValues(ptDruidAggSerde)
+                .persistent()
+                //.windowed()
+                .build();
 
-        //
-        // STEP 1c: Build Topology
-        //
         TopologyBuilder topologyBuilder = new TopologyBuilder();
         topologyBuilder
             .addSource("SOURCE", stringDeserializer, trafficMessageDeserializer, ptiMessagesTopic)
 
+            .addProcessor("DRUID-AGG", () -> new PtDruidAggProcessor(), "SOURCE")
+
+            .addStateStore(druidStoreSupplier, "DRUID-AGG")
+
             .addSink("SINK", ptoKaskada0Topic, stringSerializer, trafficMessageSerializer, "SOURCE")
+            .addSink("SINK-DRUID", ptoDruidAgg, stringSerializer, ptDruidAggSerializer, "DRUID-AGG")
         ;
+
 
         //
         // STEP 2: Execute topology
@@ -106,19 +134,20 @@ public class PtInputTest {
         //
         // STEP 3: Generate some input
         //
-        List<KeyValue<Integer, TrafficMessage>> trafficData = Arrays.asList(
-                TRAFFIC(1,3)
+        List<KeyValue<String, TrafficMessage>> trafficData = Arrays.asList(
+                TRAFFIC(1,3), TRAFFIC(2,4), TRAFFIC(1,5), TRAFFIC(1,6), TRAFFIC(2,7)
         );
         IntegrationTestUtils.produceKeyValuesSynchronously(ptiMessagesTopic, trafficData
-                , producerConfig(IntegerSerializer.class, TrafficMessageSerializer.class));
+                , producerConfig(StringSerializer.class, TrafficMessageSerializer.class.getName()));
 
         //
         // STEP 9: Show output
         //
         Thread.sleep(1000);     // wait 1 sec
 
-        SHOW_TRAFFIC(ptiMessagesTopic);
-        SHOW_TRAFFIC(ptoKaskada0Topic);
+        SHOW(ptiMessagesTopic);
+        SHOW(ptoKaskada0Topic);
+        SHOW(ptoDruidAgg);
 
         System.out.println();
 
@@ -133,18 +162,35 @@ public class PtInputTest {
         System.out.println("[" + dateFormat.format(date) + "] " + s);
     }
 
-    private KeyValue<Integer, TrafficMessage> TRAFFIC(int sequenceId, Integer statusId) {
-        return new KeyValue<>(sequenceId, new TrafficMessage(sequenceId, statusId));
+    private KeyValue<String, TrafficMessage> TRAFFIC(int sequenceId, Integer statusId) {
+        return new KeyValue<>(String.valueOf(sequenceId), new TrafficMessage(sequenceId, statusId));
+    }
+
+    private void SHOW (String topic) {
+        System.out.println();
+        System.out.println(topic);
+        List<KeyValue<String, String>> list = IntegrationTestUtils.readKeyValues(topic
+                , consumerConfig(StringDeserializer.class, StringDeserializer.class.getName()));
+        System.out.println(list);
     }
 
     private void SHOW_TRAFFIC (String topic) {
         System.out.println();
         System.out.println(topic);
-        List<KeyValue<Integer, TrafficMessage>> list = IntegrationTestUtils.readKeyValues(topic, consumerConfig(IntegerDeserializer.class, TrafficMessageDeserializer.class));
+        List<KeyValue<String, TrafficMessage>> list = IntegrationTestUtils.readKeyValues(topic
+                , consumerConfig(StringDeserializer.class, TrafficMessageDeserializer.class.getName()));
         System.out.println(list);
     }
 
-    private Properties producerConfig(Class keySerializer, Class valueSerializer) {
+    private void SHOW_DRUID (String topic) {
+        System.out.println();
+        System.out.println(topic);
+        List<KeyValue<String, PtDruidAgg>> list = IntegrationTestUtils.readKeyValues(topic
+                , consumerConfig(StringDeserializer.class, StringDeserializer.class.getName()));
+        System.out.println(list);
+    }
+
+    private Properties producerConfig(Class keySerializer, String valueSerializer) {
         Properties producerConfig = new Properties();
         producerConfig.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
         producerConfig.put(ProducerConfig.ACKS_CONFIG, "all");
@@ -154,13 +200,14 @@ public class PtInputTest {
         return producerConfig;
     }
 
-    private Properties consumerConfig(Class keyDeserializer, Class valueDeserializer) {
+    private Properties consumerConfig(Class keyDeserializer, String valueDeserializer) {
         Properties consumerConfig = new Properties();
         consumerConfig.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
-        consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, "noc-integration-test-standard-consumer-" + valueDeserializer.getSimpleName() + "-" + RandomUtils.nextInt(10000));
+        consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, "pt-input-test-standard-consumer-" + valueDeserializer/*.getSimpleName()*/ + "-" + RandomUtils.nextInt(10000));
         consumerConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         consumerConfig.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, keyDeserializer);
         consumerConfig.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, valueDeserializer);
+        //System.out.println(consumerConfig);
         return consumerConfig;
     }
 

@@ -13,6 +13,7 @@ public class TrafficMessageDeserializer implements Deserializer<TrafficMessage> 
 
     private static final ObjectMapper mapper = new ObjectMapper();
 
+    @Override
     public TrafficMessage deserialize(String topic, byte[] data) {
         try {
             return mapper.readValue(data, TrafficMessage.class);
