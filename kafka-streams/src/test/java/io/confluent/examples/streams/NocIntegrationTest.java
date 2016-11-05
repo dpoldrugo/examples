@@ -51,13 +51,25 @@ public class NocIntegrationTest {
     private static final String trafficMessagesTopic = "traffic-messages";
     private static final String deltaMessagesTopic = "delta-messages";
     private static final String outputTopic = "output-topic";
+    private static final String outputTopicPrevious = "output-topic-previous";
     private static final String outputTopicAgg = "output-topic-agg";
+    private static final String outputTopicAggPrevious = "output-topic-agg-previous";
+
+    private static final String currentPreviousTopic = "current-previous-topic";
+
+    private static final String resultTopic = "result-topic";
 
     @BeforeClass
     public static void startKafkaCluster() throws Exception {
         CLUSTER.createTopic(trafficMessagesTopic);
         CLUSTER.createTopic(deltaMessagesTopic);
         CLUSTER.createTopic(outputTopic);
+
+        CLUSTER.createTopic(outputTopicPrevious);
+        CLUSTER.createTopic(outputTopicAggPrevious);
+        CLUSTER.createTopic(resultTopic);
+
+        CLUSTER.createTopic("out2");
     }
 
     @Test
@@ -72,9 +84,11 @@ public class NocIntegrationTest {
         final Serde<TrafficMessage> trafficMessageSerde = Serdes.serdeFrom(PojoSerde.serializer(TrafficMessage.class), PojoSerde.deserializer(TrafficMessage.class));
         final Serde<DeltaMessage> deltaMessageSerde = Serdes.serdeFrom(PojoSerde.serializer(DeltaMessage.class), PojoSerde.deserializer(DeltaMessage.class));
         final Serde<JoinMessage> joinMessageSerde = Serdes.serdeFrom(PojoSerde.serializer(JoinMessage.class), PojoSerde.deserializer(JoinMessage.class));
+        final Serde<JoinMessageCurrentAndPrevious> joinMessageCurrentAndPreviousSerde = Serdes.serdeFrom(PojoSerde.serializer(JoinMessageCurrentAndPrevious.class), PojoSerde.deserializer(JoinMessageCurrentAndPrevious.class));
+        final Serde<ResultMessage> resultMessageSerde = Serdes.serdeFrom(PojoSerde.serializer(ResultMessage.class), PojoSerde.deserializer(ResultMessage.class));
 
         Properties streamsConfiguration = new Properties();
-        streamsConfiguration.put(StreamsConfig.APPLICATION_ID_CONFIG, "noc-integration-test");
+        streamsConfiguration.put(StreamsConfig.APPLICATION_ID_CONFIG, "noc-integration-filtering");
         streamsConfiguration.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
         streamsConfiguration.put(StreamsConfig.ZOOKEEPER_CONNECT_CONFIG, CLUSTER.zookeeperConnect());
         streamsConfiguration.put(StreamsConfig.KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
@@ -104,18 +118,40 @@ public class NocIntegrationTest {
                     JoinMessage joinMessage = new JoinMessage(trafficMessage.getSequenceId(), trafficMessage.getStatusId(), deltaMessage.getCountDelta());
 
                     return joinMessage;
-                }, JoinWindows.of("joinName").within(TimeUnit.SECONDS.toMillis(1)), intSerde, trafficMessageSerde, deltaMessageSerde);
+                }, JoinWindows.of("joinName").within(TimeUnit.SECONDS.toMillis(60)), intSerde, trafficMessageSerde, deltaMessageSerde);
 
         // Write the (continuously updating) results to the output topic.
         joinStream.to(intSerde, joinMessageSerde, outputTopic);
 
         KStream<Integer, JoinMessage> outStream = builder.stream(intSerde, joinMessageSerde, outputTopic);
 
-        KTable<Integer, JoinMessage> outStreamAgg = outStream.aggregateByKey(() -> new JoinMessage(-1, -1, 0), (aggKey, value, aggregate) -> {
+        KTable<Integer, JoinMessage> outStreamAggTable = outStream.aggregateByKey(() -> new JoinMessage(-1, -1, 0), (aggKey, value, aggregate) -> {
             return new JoinMessage(aggKey, value.getStatusId(), value.getCountDelta() + aggregate.getCountDelta());
         }, intSerde, joinMessageSerde, "join-agg");
 
-        outStreamAgg.to(intSerde, joinMessageSerde, outputTopicAgg);
+        outStreamAggTable.to(intSerde, joinMessageSerde, outputTopicAgg);
+
+        KStream<Integer, JoinMessage> through = outStream.through(intSerde, joinMessageSerde, "out2");
+
+        KTable<Integer, JoinMessage> outPreviousTable = builder.table(intSerde, joinMessageSerde, outputTopicPrevious);
+        KStream<Integer, JoinMessageCurrentAndPrevious> currentPreviousOutStream = through
+                .leftJoin(outPreviousTable, (current, previous) -> new JoinMessageCurrentAndPrevious(current, previous));
+        currentPreviousOutStream.to(intSerde, joinMessageCurrentAndPreviousSerde, currentPreviousTopic);
+
+        KTable<Integer, JoinMessage> outAggPreviousTable = builder.table(intSerde, joinMessageSerde, outputTopicAggPrevious);
+        KStream<Integer, JoinMessageCurrentAndPrevious> currentPreviousOutAggStream = outStreamAggTable
+                .toStream()
+                .leftJoin(outAggPreviousTable, (current, previous) -> new JoinMessageCurrentAndPrevious(current, previous));
+
+        KStream<Integer, ResultMessage> resultStream = currentPreviousOutStream
+                .join(currentPreviousOutAggStream, (delta, agg) -> new ResultMessage(delta, agg),
+                        JoinWindows.of("delta-agg-join").within(TimeUnit.SECONDS.toMillis(60))
+                        ,intSerde, joinMessageCurrentAndPreviousSerde, joinMessageCurrentAndPreviousSerde);
+
+        resultStream.to(intSerde, resultMessageSerde, resultTopic);
+
+        outStream.to(intSerde, joinMessageSerde, outputTopicPrevious);
+        outStreamAggTable.to(intSerde, joinMessageSerde, outputTopicAggPrevious);
 
         KafkaStreams streams = new KafkaStreams(builder, streamsConfiguration);
         streams.start();
@@ -153,10 +189,8 @@ public class NocIntegrationTest {
 
         IntegrationTestUtils.produceKeyValuesSynchronously(trafficMessagesTopic, trafficData, trafficMessagesProducerConfig);
 
-//    IntegrationTestUtils.produceKeyValuesSynchronously(deltaMessagesTopic, Arrays.asList(
-//            new KeyValue<>(1, new DeltaMessage(1, 2))
-//    ), deltaMessagesProducerConfig);
 
+        Thread.sleep(2000);
 
         System.out.println(trafficMessagesTopic);
         List<KeyValue<Integer, TrafficMessage>> trafficInTopic = IntegrationTestUtils.readKeyValues(trafficMessagesTopic, consumerConfig(IntegerDeserializer.class, TrafficMessageDeserializer.class));
@@ -168,12 +202,48 @@ public class NocIntegrationTest {
         System.out.println(deltasInTopic);
 
         System.out.println(outputTopic);
-        List<KeyValue<Integer, DeltaMessage>> outputInTopic = IntegrationTestUtils.readKeyValues(outputTopic, consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class));
+        List<KeyValue<Integer, JoinMessage>> outputInTopic = IntegrationTestUtils.readKeyValues(outputTopic, consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class));
         System.out.println(outputInTopic);
 
+        System.out.println(outputTopicPrevious);
+        List<KeyValue<Integer, DeltaMessage>> outputPreviousInTopic = IntegrationTestUtils.readKeyValues(outputTopicPrevious, consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class));
+        System.out.println(outputPreviousInTopic);
+
+        System.out.println(currentPreviousTopic);
+        List<KeyValue<Integer, JoinMessageCurrentAndPrevious>> outputCurrentPreviousInTopic = IntegrationTestUtils.readKeyValues(currentPreviousTopic, consumerConfig(IntegerDeserializer.class, JoinMessageCurrentAndPreviousDeserializer.class));
+        System.out.println(outputCurrentPreviousInTopic);
+
         System.out.println(outputTopicAgg);
-        List<KeyValue<Integer, DeltaMessage>> outputAggInTopic = IntegrationTestUtils.readKeyValues(outputTopicAgg, consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class));
+        List<KeyValue<Integer, JoinMessage>> outputAggInTopic = IntegrationTestUtils.readKeyValues(outputTopicAgg, consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class));
         System.out.println(outputAggInTopic);
+
+        System.out.println(outputTopicAggPrevious);
+        List<KeyValue<Integer, JoinMessage>> outputAggPreviousInTopic = IntegrationTestUtils.readKeyValues(outputTopicAggPrevious, consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class));
+        System.out.println(outputAggPreviousInTopic);
+
+        System.out.println(resultTopic);
+        List<KeyValue<Integer, ResultMessage>> outputInResultTopic = IntegrationTestUtils.readKeyValues(resultTopic, consumerConfig(IntegerDeserializer.class, ResultMessageDeserializer.class));
+        System.out.println(outputInResultTopic);
+
+        Thread.sleep(2000);
+
+        IntegrationTestUtils.produceKeyValuesSynchronously(deltaMessagesTopic, Arrays.asList(
+                new KeyValue<>(1, new DeltaMessage(1, 2))
+        ), deltaMessagesProducerConfig);
+
+        System.out.println(outputTopicPrevious);
+        List<KeyValue<Integer, DeltaMessage>> outputPreviousInTopicAgain = IntegrationTestUtils.readKeyValues(outputTopicPrevious, consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class));
+        System.out.println(outputPreviousInTopicAgain);
+
+        System.out.println(currentPreviousTopic);
+        List<KeyValue<Integer, JoinMessageCurrentAndPrevious>> outputCurrentPreviousInTopicAgain = IntegrationTestUtils.readKeyValues(currentPreviousTopic, consumerConfig(IntegerDeserializer.class, JoinMessageCurrentAndPreviousDeserializer.class));
+        System.out.println(outputCurrentPreviousInTopicAgain);
+
+        System.out.println(resultTopic);
+        List<KeyValue<Integer, ResultMessage>> outputInResultTopicAgain = IntegrationTestUtils.readKeyValues(resultTopic, consumerConfig(IntegerDeserializer.class, ResultMessageDeserializer.class));
+        System.out.println(outputInResultTopicAgain);
+
+
 
 
         List<KeyValue<Integer, JoinMessage>> actualJoinMessages = IntegrationTestUtils.waitUntilMinKeyValueRecordsReceived(consumerConfig(IntegerDeserializer.class, JoinMessageDeserializer.class),
@@ -190,7 +260,7 @@ public class NocIntegrationTest {
     private Properties consumerConfig(Class keyDeserializer, Class valueDeserializer) {
         Properties consumerConfig = new Properties();
         consumerConfig.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
-        consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, "noc-integration-test-standard-consumer-" + valueDeserializer.getSimpleName() + "-" + RandomUtils.nextInt(10000));
+        consumerConfig.put(ConsumerConfig.GROUP_ID_CONFIG, "noc-integration-filtering-standard-consumer-" + valueDeserializer.getSimpleName() + "-" + RandomUtils.nextInt(10000));
         consumerConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         consumerConfig.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, keyDeserializer);
         consumerConfig.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, valueDeserializer);
